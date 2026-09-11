@@ -10,7 +10,12 @@
 | `SWITCH_UNLOCKED_AFTER_CLEAR` | 信号开放后道岔解锁（FPL 未锁闭或道岔杠杆仍可扳动） |
 | `CONFLICT_SIMULTANEOUS_CLEAR` | 冲突进路的信号同时开放 |
 | `PREMATURE_RELEASE` | 列车通过前提前释放（接近锁闭/区段释放） |
-| `ROUTE_DEADLOCKED` | 应允许的进路被锁条错误锁死 |
+| `ROUTE_DEADLOCKED` | 应允许的进路被锁条错误锁死（仅完整展开时判定） |
+
+`PREMATURE_RELEASE` 的判定以"锁闭曾建立"为前提：只有信号已开放、
+进路各道岔锁闭（FPL 已锁或杠杆不可动）曾建立（轨迹中体现为
+`armed_routes`），随后在列车通过前被解除时才报告；信号未开放过、
+FPL 未锁闭过的轨迹不触发。
 
 发现问题时返回**最短反例轨迹**：逐步列出杠杆位置、区段占用、生效锁条、
 命中规则和首个违规状态。状态空间超出限制时明确报告已检查边界
@@ -91,4 +96,6 @@ python -m pytest tests/                    # 运行测试
 3. `POST /versions/{new}/verify` 复验，`GET /compare?from=..&to=..` 对比变化。
 
 注意：`ok=true` 且 `complete=true` 才构成完整证明；
-`complete=false` 时结果只覆盖已检查边界。
+`complete=false` 时结果只覆盖已检查边界——此时不会把"暂未到达终态"
+报成 `ROUTE_DEADLOCKED`，也不会因此把 `ok` 置为 `false`
+（已发现的真实反例不受影响，仍如实报告并持久化）。

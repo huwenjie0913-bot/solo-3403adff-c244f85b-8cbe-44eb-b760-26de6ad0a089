@@ -151,6 +151,36 @@ class _Ctx:
     def route_set(self, L: tuple[int, ...], ri: int) -> bool:
         return all(L[pt["lever"]] == pt["want"] for pt in self.routes[ri]["points"])
 
+    def point_locked(self, L: tuple[int, ...], occ: frozenset, pt: dict) -> bool:
+        """道岔当前是否被锁闭：FPL 已锁闭，或无 FPL 时杠杆不可扳动。"""
+        if pt["fpl_lever"] is not None:
+            return L[pt["fpl_lever"]] == pt["fpl_pos"]
+        return not self.movable(L, pt["lever"], occ)
+
+    def route_locked(self, L: tuple[int, ...], occ: frozenset, ri: int) -> bool:
+        """进路锁闭已建立：信号开放且进路各道岔均被锁闭。"""
+        if not self.signal_clear(L, ri):
+            return False
+        return all(self.point_locked(L, occ, pt)
+                   for pt in self.routes[ri]["points"])
+
+    def update_armed(self, A: tuple[int, ...], L: tuple[int, ...],
+                     T: tuple[int, ...], occ: frozenset) -> tuple[int, ...]:
+        """更新各进路的“锁闭已建立”标志。
+
+        置位：信号开放且进路锁闭建立；复位：进路上无列车
+        （无车时解锁属正常取消，下一列车开始新的锁闭周期）。
+        """
+        out = []
+        for ri in range(len(self.routes)):
+            if self.route_locked(L, occ, ri):
+                out.append(1)
+            elif T[ri] == -1:
+                out.append(0)
+            else:
+                out.append(A[ri])
+        return tuple(out)
+
     # ---------------------------------------------------------- 状态检查
 
     def state_violations(self, L: tuple[int, ...], occ: frozenset) -> list[dict]:
@@ -185,11 +215,12 @@ class _Ctx:
         return out
 
     def transition_violation(self, L: tuple[int, ...], T: tuple[int, ...],
-                             lever: int) -> Optional[dict]:
-        """提前释放：列车尚未通过某道岔防护的区段，就解除其道岔锁闭。
+                             A: tuple[int, ...], lever: int) -> Optional[dict]:
+        """提前释放：进路锁闭曾在信号开放下建立，列车通过前又被解除。
 
-        道岔杠杆的任何扳动都算释放；FPL 杠杆只有“离开锁闭位”
-        （解锁方向）才算，扳向锁闭位是安全操作。
+        仅当 armed（锁闭已建立）时才可能报告；信号未开放过、FPL 未锁闭
+        过的轨迹不触发。道岔杠杆的任何扳动都算释放；FPL 杠杆只有
+        “离开锁闭位”（解锁方向）才算，扳向锁闭位是安全操作。
         """
         if not (self.spec.rules.section_release or self.spec.rules.approach_locking):
             return None
@@ -197,6 +228,8 @@ class _Ctx:
             st = T[ri]
             if st < 0:
                 continue
+            if not A[ri]:
+                continue  # 锁闭未曾建立，谈不上“释放”
             if protect_idx is not None and st > protect_idx:
                 continue  # 列车已越过该道岔防护的区段
             if kind == "fpl" and L[lever] != fpl_pos:
@@ -205,7 +238,7 @@ class _Ctx:
             at = r["positions"][st]
             return {
                 "category": PREMATURE_RELEASE,
-                "message": f"列车在区段 {at}（进路 {r['id']}）时，"
+                "message": f"进路 {r['id']} 锁闭已建立，列车在区段 {at} 时，"
                            f"道岔 {point_id} 的锁闭被提前释放",
                 "detail": {"route": r["id"], "point": point_id,
                            "train_at": at, "lever": self.lever_ids[lever]},
@@ -215,13 +248,14 @@ class _Ctx:
     # ---------------------------------------------------------- 后继展开
 
     def successors(self, state):
-        L, T = state
+        L, T, A = state
         occ = frozenset(self.occupancy(T))
         for b in range(self.n_levers):
             if self.can_move(L, b, occ):
                 L2 = list(L)
                 L2[b] ^= 1
-                yield (tuple(L2), T), ("lever", b)
+                L2 = tuple(L2)
+                yield (L2, T, self.update_armed(A, L2, T, occ)), ("lever", b)
         for ri, r in enumerate(self.routes):
             pos = r["positions"]
             if not pos:
@@ -231,17 +265,26 @@ class _Ctx:
                 if pos[0] not in occ:
                     T2 = list(T)
                     T2[ri] = 0
-                    yield (L, tuple(T2)), ("train", ri, "enter", pos[0])
+                    T2 = tuple(T2)
+                    occ2 = frozenset(self.occupancy(T2))
+                    yield (L, T2, self.update_armed(A, L, T2, occ2)), \
+                        ("train", ri, "enter", pos[0])
             elif st == len(pos) - 1:
                 T2 = list(T)
                 T2[ri] = -1
-                yield (L, tuple(T2)), ("train", ri, "leave", pos[st])
+                T2 = tuple(T2)
+                occ2 = frozenset(self.occupancy(T2))
+                yield (L, T2, self.update_armed(A, L, T2, occ2)), \
+                    ("train", ri, "leave", pos[st])
             else:
                 nxt = pos[st + 1]
                 if nxt not in occ:
                     T2 = list(T)
                     T2[ri] = st + 1
-                    yield (L, tuple(T2)), ("train", ri, "advance", pos[st], nxt)
+                    T2 = tuple(T2)
+                    occ2 = frozenset(self.occupancy(T2))
+                    yield (L, T2, self.update_armed(A, L, T2, occ2)), \
+                        ("train", ri, "advance", pos[st], nxt)
 
     # ---------------------------------------------------------- 轨迹重构
 
@@ -287,7 +330,7 @@ class _Ctx:
 
         steps = []
         for i, (st, prev, action) in enumerate(chain):
-            L, T = st
+            L, T, A = st
             occ_list = self.occupancy(T)
             pre_L = prev[0] if prev else L
             pre_occ = frozenset(self.occupancy(prev[1])) if prev else frozenset()
@@ -301,6 +344,8 @@ class _Ctx:
                      "at": self.routes[ri]["positions"][t]}
                     for ri, t in enumerate(T) if t >= 0
                 ],
+                "armed_routes": [self.routes[ri]["id"]
+                                 for ri, a in enumerate(A) if a],
                 "active_locks": self.active_locks(L, frozenset(occ_list)),
                 "rules_hit": self.rules_hit_for(pre_L, pre_occ, action) if prev else [],
             }
@@ -341,7 +386,10 @@ def verify(spec: Spec) -> dict:
     ctx = _Ctx(spec)
     t0 = time.perf_counter()
 
-    init = (ctx.init_levers, tuple(-1 for _ in ctx.routes))
+    init_T = tuple(-1 for _ in ctx.routes)
+    init_A = ctx.update_armed(tuple(0 for _ in ctx.routes),
+                              ctx.init_levers, init_T, frozenset())
+    init = (ctx.init_levers, init_T, init_A)
     parent: dict = {init: (None, None)}
     depth_of = {init: 0}
     q = deque([init])
@@ -357,7 +405,7 @@ def verify(spec: Spec) -> dict:
     limits = spec.limits
     while q:
         state = q.popleft()
-        L, T = state
+        L, T, A = state
         d = depth_of[state]
         n_states += 1
         max_depth_seen = max(max_depth_seen, d)
@@ -391,7 +439,7 @@ def verify(spec: Spec) -> dict:
         for nxt, action in ctx.successors(state):
             # 提前释放是“迁移”违规：与目标状态是否已访问无关，先判定
             if action[0] == "lever" and PREMATURE_RELEASE not in violations:
-                tv = ctx.transition_violation(L, T, action[1])
+                tv = ctx.transition_violation(L, T, A, action[1])
                 if tv is not None:
                     violations[PREMATURE_RELEASE] = {
                         **tv, "depth": d + 1,
@@ -403,25 +451,28 @@ def verify(spec: Spec) -> dict:
             depth_of[nxt] = d + 1
             q.append(nxt)
 
-    # 合法进路被错误锁死（只有完整展开时才是定论）
-    for ri, r in enumerate(ctx.routes):
-        if r["should_allow"] and ri not in goal_found:
-            sat, st = best.get(ri, (0, init))
-            want = {ctx.lever_ids[pt["lever"]]: POS[pt["want"]] for pt in r["points"]}
-            got = {ctx.lever_ids[pt["lever"]]: POS[st[0][pt["lever"]]]
-                   for pt in r["points"]}
-            unsat = [k for k in want if want[k] != got[k]]
-            v = {
-                "category": ROUTE_DEADLOCKED,
-                "message": f"进路 {r['id']} 应当允许，但无法排列并开放信号"
-                           f"（杠杆 {', '.join(unsat) or '—'} 无法到位）",
-                "detail": {"route": r["id"], "required": want,
-                           "blocked_levers": unsat,
-                           "complete": complete},
-                "depth": depth_of[st],
-                "_state": st,
-            }
-            violations.setdefault(ROUTE_DEADLOCKED, v)
+    # 合法进路被错误锁死：只有完整展开时“未到达终态”才是定论；
+    # 截断时不得把暂未到达当作锁死（保留 boundary 说明即可）。
+    if complete:
+        for ri, r in enumerate(ctx.routes):
+            if r["should_allow"] and ri not in goal_found:
+                sat, st = best.get(ri, (0, init))
+                want = {ctx.lever_ids[pt["lever"]]: POS[pt["want"]]
+                        for pt in r["points"]}
+                got = {ctx.lever_ids[pt["lever"]]: POS[st[0][pt["lever"]]]
+                       for pt in r["points"]}
+                unsat = [k for k in want if want[k] != got[k]]
+                v = {
+                    "category": ROUTE_DEADLOCKED,
+                    "message": f"进路 {r['id']} 应当允许，但无法排列并开放信号"
+                               f"（杠杆 {', '.join(unsat) or '—'} 无法到位）",
+                    "detail": {"route": r["id"], "required": want,
+                               "blocked_levers": unsat,
+                               "complete": complete},
+                    "depth": depth_of[st],
+                    "_state": st,
+                }
+                violations.setdefault(ROUTE_DEADLOCKED, v)
 
     # 输出
     out_violations = []

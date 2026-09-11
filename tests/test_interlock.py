@@ -127,7 +127,7 @@ def test_conflict_simultaneous_clear():
 
 
 def test_premature_release():
-    """无轨道锁闭：列车在进路内时信号员恢复信号并解锁 FPL → 提前释放。"""
+    """无轨道锁闭：锁闭建立后，列车通过前解除 FPL → 提前释放。"""
     spec = base_spec()
     spec["locking"] = [
         {"id": "E1", "lever_a": "S1", "pos_a": "R", "lever_b": "F", "pos_b": "R"},
@@ -137,13 +137,50 @@ def test_premature_release():
     cats = [v["category"] for v in res["violations"]]
     assert "PREMATURE_RELEASE" in cats
     v = next(v for v in res["violations"] if v["category"] == "PREMATURE_RELEASE")
-    # 最短反例：列车进入接近区段后直接扳动未锁闭的道岔/FPL 杠杆
+    # 最短反例：F→R，S1→R（锁闭建立），列车进入，S1→N，再解除 F
     last = v["trace"][-1]
     assert last["action"]["type"] == "lever"
-    assert last["action"]["lever"] in ("P", "F")
-    assert v["depth"] == 2
+    assert last["action"]["lever"] == "F"
+    assert v["depth"] == 5
     assert any(t["route"] == "R1" for t in last["trains"])
-    assert last["violation"]["detail"]["lever"] == last["action"]["lever"]
+    assert last["violation"]["detail"]["lever"] == "F"
+    # 违规前的轨迹中必先出现“信号开放且 FPL 锁闭”的状态
+    assert any(s["levers"]["S1"] == "R" and s["levers"]["F"] == "R"
+               for s in v["trace"][:-1])
+    assert "R1" in v["trace"][-2]["armed_routes"]
+
+
+def test_no_premature_release_without_established_locking():
+    """回归：信号未开放、FPL 未锁闭的轨迹不得触发 PREMATURE_RELEASE。
+
+    旧实现会在“列车进入接近区段后直接扳动空闲道岔杠杆”（深度 2）
+    误报提前释放；修复后该路径不得触发，唯一反例须经过锁闭建立。
+    """
+    spec = base_spec()
+    spec["locking"] = [
+        {"id": "E1", "lever_a": "S1", "pos_a": "R", "lever_b": "F", "pos_b": "R"},
+        {"id": "E2", "lever_a": "F", "pos_a": "R", "lever_b": "P", "pos_b": "N"},
+    ]
+    _, res = create_and_verify(spec, "no-false-premature")
+    v = next(v for v in res["violations"] if v["category"] == "PREMATURE_RELEASE")
+    # 深度 2 的“列车进入 + 扳 P”误报已消除（反例须先建立锁闭，深度 ≥ 5）
+    assert v["depth"] >= 5
+    # 每条违规轨迹在释放前都经历过锁闭建立（armed）状态
+    assert any("R1" in s["armed_routes"] for s in v["trace"][:-1])
+
+
+def test_no_premature_release_when_never_armed():
+    """回归：锁闭从未建立（信号从未开放）时，整类违规不得出现。"""
+    spec = base_spec()
+    # E1 使 S1 开放必须先 F=R；E3 又让 F=R 时必须 S1=N —— 信号永远无法
+    # 与 FPL 锁闭同时成立，锁闭从未建立。列车占用期间扳动 P/F 不得误报。
+    spec["locking"] = [
+        {"id": "E1", "lever_a": "S1", "pos_a": "R", "lever_b": "F", "pos_b": "R"},
+        {"id": "E3", "lever_a": "F", "pos_a": "R", "lever_b": "S1", "pos_b": "N"},
+    ]
+    _, res = create_and_verify(spec, "never-armed")
+    cats = [v["category"] for v in res["violations"]]
+    assert "PREMATURE_RELEASE" not in cats
 
 
 def test_route_deadlocked():
@@ -170,11 +207,47 @@ def test_good_spec_passes():
 def test_boundary_reported_when_state_space_truncated():
     spec = good_spec()
     spec["limits"]["max_states"] = 5
-    _, res = create_and_verify(spec, "bounded")
+    vid, res = create_and_verify(spec, "bounded")
     assert res["complete"] is False
     assert "boundary" in res
     assert res["boundary"]["states_checked"] == 5
     assert "不构成完整证明" in res["boundary"]["note"]
+    # 截断时不得把暂未到达终态当作锁死，也不得置 ok=false
+    cats = [v["category"] for v in res["violations"]]
+    assert "ROUTE_DEADLOCKED" not in cats
+    assert res["ok"] is True
+    # 持久化的运行记录同样不得含确定违规
+    run = client.get(f"/versions/{vid}/runs").json()[0]
+    assert run["ok"] is True
+    assert run["violations_count"] == 0
+    assert run["complete"] is False
+
+
+def test_no_deadlock_verdict_when_truncated():
+    """回归：锁死规格在截断时不得报 ROUTE_DEADLOCKED（完整展开时才报）。"""
+    spec = deadlock_spec()
+    spec["limits"]["max_states"] = 2
+    _, res = create_and_verify(spec, "deadlock-truncated")
+    assert res["complete"] is False
+    assert "boundary" in res
+    cats = [v["category"] for v in res["violations"]]
+    # 截断时不得把暂未到达终态当作锁死
+    assert "ROUTE_DEADLOCKED" not in cats
+    # 但已发现的真实违规（信号开放后 FPL 未锁闭）仍应报告
+    assert "SWITCH_UNLOCKED_AFTER_CLEAR" in cats
+    # 同一规格完整展开时仍应报锁死（见 test_route_deadlocked）
+
+
+def test_truncation_keeps_genuine_violations():
+    """截断只抑制“未到达终态”的推断，已发现的真实反例仍然有效。"""
+    spec = conflict_spec()
+    spec["limits"]["max_states"] = 6  # 足以展开到冲突状态，但不穷尽
+    _, res = create_and_verify(spec, "truncated-real-violation")
+    assert res["complete"] is False
+    assert "boundary" in res
+    cats = [v["category"] for v in res["violations"]]
+    assert "CONFLICT_SIMULTANEOUS_CLEAR" in cats
+    assert res["ok"] is False
 
 
 # ---------------------------------------------------------------- 修订
