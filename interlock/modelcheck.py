@@ -474,16 +474,19 @@ def verify(spec: Spec) -> dict:
                 }
                 violations.setdefault(ROUTE_DEADLOCKED, v)
 
-    # 输出
+    # 输出。截断（未穷尽）时不得返回确定违规：结果只能说明 boundary
+    # 与已检查范围；只有完整展开时才给出违规判定与最短反例。
     out_violations = []
-    for cat in (SWITCH_UNLOCKED, CONFLICT_CLEAR, PREMATURE_RELEASE, ROUTE_DEADLOCKED):
-        if cat not in violations:
-            continue
-        v = violations[cat]
-        st = v.pop("_state")
-        final = v.pop("_final", None)
-        v["trace"] = ctx.build_trace(parent, st, v, final=final)
-        out_violations.append(v)
+    if complete:
+        for cat in (SWITCH_UNLOCKED, CONFLICT_CLEAR,
+                    PREMATURE_RELEASE, ROUTE_DEADLOCKED):
+            if cat not in violations:
+                continue
+            v = violations[cat]
+            st = v.pop("_state")
+            final = v.pop("_final", None)
+            v["trace"] = ctx.build_trace(parent, st, v, final=final)
+            out_violations.append(v)
 
     result = {
         "complete": complete,
@@ -506,7 +509,9 @@ def verify(spec: Spec) -> dict:
             "depth_reached": max_depth_seen,
             "max_states": limits.max_states,
             "max_depth": limits.max_depth,
-            "note": "状态空间未穷尽：以上仅为已检查边界内的部分结果，"
-                    "不构成完整证明；无反例不代表性质成立。",
+            "note": "状态空间未穷尽：结果仅说明已检查边界"
+                    f"（{n_states} 个状态、深度 {max_depth_seen}），"
+                    "不返回确定违规，ok 仅表示“无定论”而非“无问题”；"
+                    "需提高 max_states/max_depth 重新校核才能获得完整证明。",
         }
     return result

@@ -211,7 +211,7 @@ def test_boundary_reported_when_state_space_truncated():
     assert res["complete"] is False
     assert "boundary" in res
     assert res["boundary"]["states_checked"] == 5
-    assert "不构成完整证明" in res["boundary"]["note"]
+    assert "不返回确定违规" in res["boundary"]["note"]
     # 截断时不得把暂未到达终态当作锁死，也不得置 ok=false
     cats = [v["category"] for v in res["violations"]]
     assert "ROUTE_DEADLOCKED" not in cats
@@ -230,24 +230,33 @@ def test_no_deadlock_verdict_when_truncated():
     _, res = create_and_verify(spec, "deadlock-truncated")
     assert res["complete"] is False
     assert "boundary" in res
-    cats = [v["category"] for v in res["violations"]]
-    # 截断时不得把暂未到达终态当作锁死
-    assert "ROUTE_DEADLOCKED" not in cats
-    # 但已发现的真实违规（信号开放后 FPL 未锁闭）仍应报告
-    assert "SWITCH_UNLOCKED_AFTER_CLEAR" in cats
+    # 截断时不返回任何确定违规（包括边界内本可发现的解锁违规）
+    assert res["violations"] == []
+    assert res["ok"] is True
     # 同一规格完整展开时仍应报锁死（见 test_route_deadlocked）
 
 
-def test_truncation_keeps_genuine_violations():
-    """截断只抑制“未到达终态”的推断，已发现的真实反例仍然有效。"""
+def test_truncation_reports_no_definite_violations():
+    """截断时不得返回或持久化确定违规：结果只说明 boundary 与已检查范围。"""
     spec = conflict_spec()
-    spec["limits"]["max_states"] = 6  # 足以展开到冲突状态，但不穷尽
-    _, res = create_and_verify(spec, "truncated-real-violation")
+    spec["limits"]["max_states"] = 6  # 边界内本可发现冲突并放
+    vid, res = create_and_verify(spec, "conflict-truncated")
+    # API 响应：complete=false，只有 boundary，无确定违规，ok 不为 false
     assert res["complete"] is False
     assert "boundary" in res
-    cats = [v["category"] for v in res["violations"]]
-    assert "CONFLICT_SIMULTANEOUS_CLEAR" in cats
-    assert res["ok"] is False
+    assert res["boundary"]["states_checked"] == 6
+    assert "不返回确定违规" in res["boundary"]["note"]
+    assert res["violations"] == []
+    assert res["ok"] is True
+    # SQLite 记录：同样不得含确定违规
+    run = client.get(f"/versions/{vid}/runs").json()[0]
+    assert run["ok"] is True
+    assert run["violations_count"] == 0
+    assert run["complete"] is False
+    full = client.get(f"/runs/{run['id']}").json()["result"]
+    assert full["violations"] == []
+    assert "boundary" in full
+    # 同一规格完整展开时仍报冲突并放（见 test_conflict_simultaneous_clear）
 
 
 # ---------------------------------------------------------------- 修订

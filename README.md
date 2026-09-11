@@ -18,8 +18,10 @@
 FPL 未锁闭过的轨迹不触发。
 
 发现问题时返回**最短反例轨迹**：逐步列出杠杆位置、区段占用、生效锁条、
-命中规则和首个违规状态。状态空间超出限制时明确报告已检查边界
-（`complete=false` + `boundary`），不把局部结果当作完整证明。
+命中规则和首个违规状态。状态空间超出限制时结果只说明已检查边界
+（`complete=false` + `boundary`）：不返回、不持久化确定违规，`ok`
+仅表示"无定论"而非"无问题"；只有完整展开（`complete=true`）时才
+给出违规判定与最短反例。
 
 ## 运行
 
@@ -96,6 +98,7 @@ python -m pytest tests/                    # 运行测试
 3. `POST /versions/{new}/verify` 复验，`GET /compare?from=..&to=..` 对比变化。
 
 注意：`ok=true` 且 `complete=true` 才构成完整证明；
-`complete=false` 时结果只覆盖已检查边界——此时不会把"暂未到达终态"
-报成 `ROUTE_DEADLOCKED`，也不会因此把 `ok` 置为 `false`
-（已发现的真实反例不受影响，仍如实报告并持久化）。
+`complete=false` 时结果仅说明已检查边界（状态数/深度），
+不返回也不持久化确定违规（包括"暂未到达终态"的 `ROUTE_DEADLOCKED`
+和边界内已观察到的其他违规），`ok` 不为 `false`；
+需提高 `max_states`/`max_depth` 重新校核才能获得定论。
